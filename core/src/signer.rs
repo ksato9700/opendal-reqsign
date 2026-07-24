@@ -24,8 +24,9 @@ use crate::SignRequest;
 use crate::SignRequestDyn;
 use crate::SigningCredential;
 use crate::time::Timestamp;
+use futures::lock::Mutex;
 use std::any::type_name;
-use std::sync::{Arc, Mutex};
+use std::sync::Arc;
 use std::time::Duration;
 
 /// Loads credentials and atomically signs request heads.
@@ -97,16 +98,21 @@ impl<K: SigningCredential> Signer<K> {
         req: &mut http::request::Parts,
         expires_in: Option<Duration>,
     ) -> Result<()> {
-        let credential = self.credential.lock().expect("lock poisoned").clone();
-        let credential = if credential.is_valid()
-            && expires_in.is_none_or(|d| credential.is_valid_at(Timestamp::now() + d))
+        // Held across the fetch below so concurrent callers serialize onto a single
+        // refresh instead of each independently hitting the credential provider: a
+        // waiter that acquires this lock after a refresh re-checks validity first and
+        // finds the credential the winning caller just stored.
+        let mut guard = self.credential.lock().await;
+        let credential = if guard.is_valid()
+            && expires_in.is_none_or(|d| guard.is_valid_at(Timestamp::now() + d))
         {
-            credential
+            guard.clone()
         } else {
             let ctx = self.loader.provide_credential_dyn(&self.ctx).await?;
-            *self.credential.lock().expect("lock poisoned") = ctx.clone();
+            *guard = ctx.clone();
             ctx
         };
+        drop(guard);
 
         let credential_ref = credential.as_ref().ok_or_else(|| {
             Error::credential_invalid("failed to load signing credential")
@@ -129,6 +135,7 @@ mod tests {
     use super::*;
     use crate::{ProvideCredential, SignRequest};
     use http::{HeaderValue, Method, Request, Version};
+    use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 
     #[derive(Clone, Debug)]
     struct TestCredential;
@@ -250,5 +257,122 @@ mod tests {
             Some(&HeaderValue::from_static("signed"))
         );
         assert!(!parts.headers.contains_key("x-original"));
+    }
+
+    #[derive(Clone, Debug)]
+    struct FlaggedCredential {
+        valid: Arc<AtomicBool>,
+    }
+
+    impl SigningCredential for FlaggedCredential {
+        fn is_valid(&self) -> bool {
+            self.valid.load(Ordering::SeqCst)
+        }
+    }
+
+    /// Counts every call it receives and hands out a credential backed by the same
+    /// shared `valid` flag every time, so a test can flip that flag to simulate the
+    /// cached credential expiring without needing to reach into the signer's cache.
+    #[derive(Debug)]
+    struct CountingProvider {
+        calls: Arc<AtomicUsize>,
+        delay: Duration,
+        valid: Arc<AtomicBool>,
+    }
+
+    impl ProvideCredential for CountingProvider {
+        type Credential = FlaggedCredential;
+
+        async fn provide_credential(&self, _ctx: &Context) -> Result<Option<Self::Credential>> {
+            self.calls.fetch_add(1, Ordering::SeqCst);
+            tokio::time::sleep(self.delay).await;
+            self.valid.store(true, Ordering::SeqCst);
+            Ok(Some(FlaggedCredential {
+                valid: self.valid.clone(),
+            }))
+        }
+    }
+
+    #[derive(Debug)]
+    struct NoopSigner;
+
+    impl SignRequest for NoopSigner {
+        type Credential = FlaggedCredential;
+
+        async fn sign_request(
+            &self,
+            _ctx: &Context,
+            _req: &mut http::request::Parts,
+            _credential: Option<&Self::Credential>,
+            _expires_in: Option<Duration>,
+        ) -> Result<()> {
+            Ok(())
+        }
+    }
+
+    /// Fires `n` concurrent `sign()` calls against `signer` on real OS threads and
+    /// waits for all of them to succeed.
+    async fn sign_concurrently(signer: &Arc<Signer<FlaggedCredential>>, n: usize) {
+        let handles: Vec<_> = (0..n)
+            .map(|_| {
+                let signer = signer.clone();
+                tokio::spawn(async move {
+                    let mut parts = request_parts();
+                    signer.sign(&mut parts, None).await
+                })
+            })
+            .collect();
+
+        for handle in handles {
+            handle
+                .await
+                .expect("signing task must not panic")
+                .expect("signing must succeed");
+        }
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn concurrent_callers_with_no_cached_credential_single_flight_the_refresh() {
+        let calls = Arc::new(AtomicUsize::new(0));
+        let provider = CountingProvider {
+            calls: calls.clone(),
+            delay: Duration::from_millis(20),
+            valid: Arc::new(AtomicBool::new(false)),
+        };
+        let signer = Arc::new(Signer::new(Context::new(), provider, NoopSigner));
+
+        sign_concurrently(&signer, 8).await;
+
+        assert_eq!(
+            calls.load(Ordering::SeqCst),
+            1,
+            "8 concurrent callers racing an empty credential cache must trigger exactly one fetch"
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn concurrent_callers_after_credential_expiry_single_flight_the_refresh() {
+        let calls = Arc::new(AtomicUsize::new(0));
+        let valid = Arc::new(AtomicBool::new(false));
+        let provider = CountingProvider {
+            calls: calls.clone(),
+            delay: Duration::from_millis(20),
+            valid: valid.clone(),
+        };
+        let signer = Arc::new(Signer::new(Context::new(), provider, NoopSigner));
+
+        // Warm the cache with a single call, then simulate the cached credential
+        // expiring (e.g. its TTL lapsing) before hitting it with concurrent callers.
+        sign_concurrently(&signer, 1).await;
+        assert_eq!(calls.load(Ordering::SeqCst), 1);
+        valid.store(false, Ordering::SeqCst);
+
+        sign_concurrently(&signer, 8).await;
+
+        assert_eq!(
+            calls.load(Ordering::SeqCst),
+            2,
+            "8 concurrent callers racing an expired credential must trigger exactly one more fetch"
+        );
     }
 }
