@@ -108,6 +108,15 @@ impl<K: SigningCredential> Signer<K> {
         {
             guard.clone()
         } else {
+            // Debugging aid: logs which underlying credential cell is fetching, so concurrent
+            // fetches around a rate-limit error can be told apart (same cell repeated => truly
+            // serialized through one Signer; different pointers => multiple Signer instances,
+            // each with their own independent cache, not actually sharing single-flight
+            // protection). Not for production use -- remove once the investigation concludes.
+            log::info!(
+                "reqsign-core: signer credential-cell {:p} fetching fresh credential",
+                Arc::as_ptr(&self.credential)
+            );
             let ctx = self.loader.provide_credential_dyn(&self.ctx).await?;
             *guard = ctx.clone();
             ctx
